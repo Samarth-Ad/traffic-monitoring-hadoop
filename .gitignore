@@ -1,0 +1,10 @@
+data/raw/
+data/stream/
+data/analytics/
+data/graph/
+*.pyc
+__pycache__/
+.ipynb_checkpoints/
+.venv/
+venv/
+.DS_Store

@@ -1,0 +1,4 @@
+kaggle==1.6.17
+hdfs==2.7.3
+pandas==2.2.3
+requests==2.32.3

@@ -1,0 +1,91 @@
+version: "3.9"
+
+# Dockerized Hadoop 3.4.2 + Spark 3.5 + Streamer + Streamlit dashboard.
+# All services share the ./data volume so Spark output written locally
+# is instantly visible to the dashboard. HDFS is still the primary store
+# (streamer pushes to WebHDFS; Spark reads hdfs://hadoop:9000/...).
+
+networks:
+  bdc:
+    driver: bridge
+
+volumes:
+  hadoop-data:
+
+services:
+
+  hadoop:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile
+    image: poc-hadoop:latest
+    container_name: poc-hadoop
+    hostname: hadoop
+    networks: [bdc]
+    ports:
+      - "9871:9870"   # NameNode UI
+      - "9865:9864"   # DataNode UI
+      - "8089:8088"   # ResourceManager UI
+      - "8043:8042"   # NodeManager UI
+      - "9002:9000"   # HDFS RPC
+    volumes:
+      - hadoop-data:/hadoop-data
+      - ./data:/data
+    restart: unless-stopped
+
+  spark:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.spark
+    image: poc-spark:latest
+    container_name: poc-spark
+    hostname: spark
+    networks: [bdc]
+    depends_on: [hadoop]
+    volumes:
+      - ./analytics:/app/analytics
+      - ./data:/data
+    environment:
+      - HADOOP_NAMENODE=hdfs://hadoop:9000
+    tty: true
+    command: tail -f /dev/null
+
+  streamer:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.streamer
+    image: poc-streamer:latest
+    container_name: poc-streamer
+    hostname: streamer
+    networks: [bdc]
+    depends_on: [hadoop]
+    volumes:
+      - ./python:/app
+      - ./data:/data
+    environment:
+      - WEBHDFS_URL=http://hadoop:9870
+      - HDFS_USER=root
+      - DATASET_CSV=/data/raw/Banglore_traffic_Dataset.csv
+      - BATCH_SIZE=500
+      - BATCH_INTERVAL_SECONDS=2
+    tty: true
+    command: tail -f /dev/null
+
+  dashboard:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.dashboard
+    image: poc-dashboard:latest
+    container_name: poc-dashboard
+    hostname: dashboard
+    networks: [bdc]
+    depends_on: [hadoop]
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./dashboard:/app
+      - ./data:/data
+    environment:
+      - ANALYTICS_DIR=/data/analytics
+      - GRAPH_DIR=/data/graph
+    command: streamlit run /app/app.py --server.address=0.0.0.0 --server.port=8501
