@@ -1,10 +1,18 @@
+# Generated / large data — NOT committed
 data/raw/
 data/stream/
 data/analytics/
 data/graph/
+data/models/
+
+# Intentionally committed (small, reproducible) — keep these:
+!data/source/
+!data/sample/
+
 *.pyc
 __pycache__/
 .ipynb_checkpoints/
 .venv/
 venv/
 .DS_Store
+data/demo_uploads/

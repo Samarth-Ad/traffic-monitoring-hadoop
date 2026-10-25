@@ -44,9 +44,11 @@ services:
     depends_on: [hadoop]
     volumes:
       - ./analytics:/app/analytics
+      - ./common:/app/common
       - ./data:/data
     environment:
       - HADOOP_NAMENODE=hdfs://hadoop:9000
+      - DATA_DIR=/data
     tty: true
     command: tail -f /dev/null
 
@@ -61,11 +63,14 @@ services:
     depends_on: [hadoop]
     volumes:
       - ./python:/app
+      - ./common:/app/common
       - ./data:/data
     environment:
+      - SINK=hdfs
       - WEBHDFS_URL=http://hadoop:9870
       - HDFS_USER=root
-      - DATASET_CSV=/data/raw/Banglore_traffic_Dataset.csv
+      - DATA_DIR=/data
+      - DATASET_CSV=/data/raw/bangalore_traffic.csv
       - BATCH_SIZE=500
       - BATCH_INTERVAL_SECONDS=2
     tty: true
@@ -84,8 +89,16 @@ services:
       - "8501:8501"
     volumes:
       - ./dashboard:/app
+      - ./common:/app/common
+      - ./ml:/app/ml
+      - ./analytics:/app/analytics
+      - ./mapreduce:/app/mapreduce
       - ./data:/data
     environment:
+      - DATA_DIR=/data
       - ANALYTICS_DIR=/data/analytics
       - GRAPH_DIR=/data/graph
+      - MODELS_DIR=/data/models
+      - ANOMALY_DIR=/data/analytics/anomalies
+      - MAPREDUCE_DIR=/data/analytics/mapreduce
     command: streamlit run /app/app.py --server.address=0.0.0.0 --server.port=8501

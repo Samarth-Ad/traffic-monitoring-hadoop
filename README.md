@@ -1,177 +1,229 @@
-# Bangalore Traffic Analytics — Dockerized Hadoop + Spark + Graph + Dashboard
+# Bangalore Traffic Intelligence
 
-Big Data Computing mini-project. A full pipeline that **streams** the Kaggle
-Bangalore traffic dataset into HDFS, runs **Spark batch analytics** over it,
-builds a **road-network graph** of the city from OpenStreetMap, runs classic
-**graph algorithms** on it, and serves everything in a **Streamlit dashboard**.
+**A Distributed Big Data Platform for Traffic Analytics, KNN-Based Traffic
+Prediction, and Near-Real-Time Anomaly Detection.**
 
-Hadoop 3.4.2 · Spark 3.5 · Python 3 · Streamlit · OSMnx.
+BDC (Big Data Computing) Semester 7 mini-project. A Dockerized Hadoop + Spark
+pipeline that ingests Bangalore traffic data, runs a genuine **Hadoop MapReduce**
+aggregation, a **scikit-learn KNN** volume predictor, an interpretable
+**near-real-time anomaly detector** (beyond syllabus), builds an OpenStreetMap
+**road graph** with classic graph algorithms, and serves everything in a
+**Streamlit** dashboard.
 
----
-
-## How the pieces fit together
-
-```
-                         ┌──────────────────────────────────────────┐
-  Kaggle CSV ──────────▶ │  streamer   replays CSV row-by-row         │
-  (data/raw/)            │  (poc-streamer)   ──WebHDFS──▶ HDFS        │
-                         └──────────────────────────────────────────┘
-                                             │  /traffic/stream/...
-                                             ▼
-                         ┌──────────────────────────────────────────┐
-                         │  hadoop     HDFS + YARN (poc-hadoop)       │
-                         └──────────────────────────────────────────┘
-                                             │  hdfs://hadoop:9000
-                                             ▼
-                         ┌──────────────────────────────────────────┐
-                         │  spark      PySpark batch jobs (poc-spark) │
-                         │  writes → hdfs:///traffic/analytics/       │
-                         │         → /data/analytics/*.parquet        │
-                         └──────────────────────────────────────────┘
-                                             │
-   OpenStreetMap ───▶ build_graph.py ───▶ data/graph/*.graphml,*.parquet
-   (host, osmnx)      algorithms.py                  │
-                                                     ▼
-                         ┌──────────────────────────────────────────┐
-                         │  dashboard  Streamlit (poc-dashboard)      │
-                         │  reads /data/analytics + /data/graph       │
-                         │  http://localhost:8501                     │
-                         └──────────────────────────────────────────┘
-```
-
-**Key idea:** the host `./data` folder is mounted into every container, so
-output written by Spark (or the host graph scripts) is instantly visible to the
-dashboard. HDFS is still the real store for the streaming + Spark stages; the
-dashboard is deliberately **file-based** (reads Parquet, no live HDFS needed).
-
-### Services
-
-| Service    | Image          | Container       | Role                                          |
-|------------|----------------|-----------------|-----------------------------------------------|
-| hadoop     | poc-hadoop     | `poc-hadoop`    | HDFS NameNode / DataNode / SecondaryNN + YARN |
-| spark      | poc-spark      | `poc-spark`     | PySpark 3.5 driver (batch analytics)          |
-| streamer   | poc-streamer   | `poc-streamer`  | Python producer, replays CSV → HDFS           |
-| dashboard  | poc-dashboard  | `poc-dashboard` | Streamlit app (port 8501)                     |
-
-`spark` and `streamer` idle on `tail -f /dev/null` — they're workbenches you
-`docker exec` into to run jobs, not auto-running services.
+> Hadoop 3.4.2 · Spark 3.5 · Hadoop Streaming (Python) · scikit-learn · OSMnx /
+> NetworkX · Streamlit · Docker Compose.
 
 ---
 
-## Quick start
+## 1. Problem statement & scope
 
-> **Heads up for a fresh clone:** everything under `data/` (raw, stream,
-> analytics, graph) is gitignored, so after cloning those folders are empty.
-> The dashboard will look blank until you run Phases 2–5 below to generate the
-> data. Nothing is broken — you just haven't produced the outputs yet.
+Urban traffic data is high-volume, continuously arriving, and spatially
+structured. This project demonstrates the Big Data toolchain end to end on a
+real Bangalore traffic dataset:
 
-### 0. Prerequisites
+1. **Store & distribute** the data on HDFS.
+2. **Batch-aggregate** it with MapReduce and Spark (volume / speed / congestion
+   / peak hours).
+3. **Predict** near-term traffic volume per road/time with KNN.
+4. **Detect** unusual traffic events as new batches arrive (anomaly detection).
+5. **Analyse the road network** as a graph (PageRank, centrality, shortest path).
+6. **Visualise** all of it in one dashboard.
 
-- **Docker Desktop** (running).
-- **Python 3.10+ on the host** — only needed for the graph phases (4 & 5),
-  which use OSMnx and need internet access to the OpenStreetMap Overpass API.
-- A **Kaggle account + API token** for the dataset.
+**Honest framing:** the producer *replays historical data* (a reproducible
+"near-real-time" replay), it does **not** receive live sensor feeds. "Time"
+means replay/arrival order because the raw dataset has no absolute timestamp.
 
-### 1. Get the dataset
+## 2. Dataset & canonical schema
 
-```bash
-pip install kaggle
-# Kaggle → Account → Create New API Token, save as ~/.kaggle/kaggle.json
-python python/download_dataset.py
+The committed source is `data/source/bangalore_traffic_raw.txt` — a **headerless**
+CSV with the positional schema below (1517 rows → **1478** after de-duplication,
+**14** coordinate locations across Bangalore):
+
+```
+lat , lon , day_of_week(0-6) , hour(0-23) , volume
 ```
 
-This downloads `preethamgouda/banglore-city-traffic-dataset` into
-`data/raw/Banglore_traffic_Dataset.csv`.
+`python/prepare_dataset.py` validates it and writes the **canonical schema**
+used by every component:
 
-### 2. Build & start the cluster
+| column | type | notes |
+|--------|------|-------|
+| `road_id` | str | stable id from coordinates (`loc_00`…); no fabricated names |
+| `area` | str | `Bangalore` |
+| `road` | str | coordinate-derived label |
+| `lat`, `lon` | float | Bangalore bbox checked |
+| `day_of_week` | int | 0–6 |
+| `hour` | int | 0–23 |
+| `volume` | float | traffic volume / intensity (peaks at commute hours) |
 
+**Data-quality rules** (see `common/schema.py`): required columns, numeric
+coercion, range checks (dow 0–6, hour 0–23, volume ≥ 0, coords in bbox), and
+exact-duplicate removal. Rejected rows are **never silently dropped** — they are
+written to `data/raw/rejected_rows.csv` with a reason and counted in
+`data/raw/validation_report.json`.
+
+> The optional Kaggle *named-column* CSV (`python/download_dataset.py`) is also
+> supported via column aliases, but requires a Kaggle account, so it is not
+> committed. The Spark analytics jobs target that CSV; the MapReduce/KNN/anomaly
+> path targets the committed coordinate dataset.
+
+## 3. Architecture
+
+```
+ data/source/*.txt ──prepare_dataset──▶ data/raw/bangalore_traffic.csv  (canonical)
+        │                                        │
+        │                          ┌─────────────┼───────────────────────────┐
+        ▼                          ▼             ▼                           ▼
+   stream_producer           MapReduce        KNN (ml/)              anomaly_detection
+   SINK=hdfs → HDFS          (Hadoop          sklearn →              (robust median/MAD)
+   SINK=local → data/stream   Streaming) →    data/models/*          → data/analytics/anomalies/*
+        │                     data/analytics/mapreduce/*
+        │
+   OpenStreetMap ─build_graph/algorithms─▶ data/graph/*   (host, OSMnx)
+        │
+        └────────────────────────▶  Streamlit dashboard  (reads data/*, port 8501)
+```
+
+The host `./data` folder is bind-mounted into every container, so outputs
+written by any stage are instantly visible to the dashboard (file-based; no live
+HDFS needed to view results).
+
+### Services (`docker-compose.yml`)
+| Service | Container | Role |
+|---------|-----------|------|
+| hadoop | `poc-hadoop` | HDFS (NameNode/DataNode/SecondaryNN) + YARN |
+| spark | `poc-spark` | PySpark 3.5 batch analytics (workbench) |
+| streamer | `poc-streamer` | replays CSV → HDFS (or local dir) |
+| dashboard | `poc-dashboard` | Streamlit app (http://localhost:8501) |
+
+## 4. Quick start
+
+### Option A — host only (no Docker), reproducible in seconds
+Works in any shell incl. Windows PowerShell (no bash needed):
 ```bash
+pip install -r requirements-dev.txt
+python scripts/run_pipeline_local.py
+```
+(There is also a bash version, `bash scripts/run_pipeline_local.sh`, if you
+prefer; the `.py` runner is identical and portable.) This runs Phases 1–4
+(prepare → MapReduce → KNN → stream + anomaly) and writes all dashboard inputs
+under `data/`. Run the tests with `python -m unittest discover -s tests -p "test_*.py"`.
+
+### Option B — full Docker stack
+```bash
+# 0. (optional) real Kaggle CSV:  python python/download_dataset.py
+python python/prepare_dataset.py          # build canonical CSV first
 docker compose build
-docker compose up -d
+docker compose up -d                      # NameNode UI: http://localhost:9871
 ```
+Host ports: NameNode `9871` · DataNode `9865` · ResourceManager `8089` ·
+NodeManager `8043` · HDFS RPC `9002` · Dashboard `8501`.
 
-First build is slow (Hadoop + Spark images). Check it's up:
+## 5. Running each phase
+
+| Phase | What | Where | Command |
+|-------|------|-------|---------|
+| 1 | Prepare canonical dataset | host/container | `python python/prepare_dataset.py` |
+| 2 | **MapReduce** volume by road×hour | cluster | `docker exec -it poc-hadoop bash /opt/mapreduce/run_streaming.sh` (see `mapreduce/README.md`) |
+| 2′ | MapReduce local simulation | host | `bash mapreduce/run_local.sh` |
+| 3 | **KNN** prediction | host | `python ml/knn_predict.py --k 7 --weights distance` |
+| 4 | **Anomaly** detection | host | stream with `SINK=local python/stream_producer.py` then `python analytics/anomaly_detection.py --stream-dir data/stream` |
+| S | Spark analytics (optional, Kaggle CSV) | `poc-spark` | `docker exec -it poc-spark bash /app/analytics/run_all.sh` |
+| G | Road graph + algorithms | host | `pip install -r graph/requirements.txt && python graph/build_graph.py && python graph/algorithms.py` |
+| 6 | Dashboard | `poc-dashboard` | already running → http://localhost:8501 |
+
+## 6. Dashboard
+
+There are **two** dashboards:
+
+### 6a. Interactive live dashboard — `dashboard/app.py` (recommended for demos)
+A self-contained app: choose the **built-in dataset or upload your own CSV**,
+then watch the whole pipeline run live — validation, the real MapReduce
+aggregate, KNN prediction, and a **streaming anomaly feed** where alerts appear
+batch-by-batch. No Spark/OSMnx/Docker needed; it computes everything on the fly.
+
+Run on the host (needs only `streamlit`, `pandas`, `scikit-learn` — already in
+`requirements-dev.txt`, plus streamlit):
+```bash
+pip install streamlit
+streamlit run dashboard/app.py          # http://localhost:8501
+```
+Upload format: headerless `lat,lon,day_of_week,hour,volume`, or any CSV whose
+columns map to the canonical schema. Uses Streamlit-native charts (no
+plotly/folium required).
+
+### Test datasets (real, public)
+The loader accepts real-world CSVs, not just the built-in format. It auto-detects
+columns: a **timestamp** (`date_time`, `Date`, `timestamp`, …) becomes `hour` +
+`day_of_week`; **lat/lon are optional**; and a **road / segment / sensor** column
+becomes the road id. Fetch a ready one:
+```bash
+python scripts/fetch_sample_datasets.py   # -> data/demo_uploads/metro_interstate_traffic_volume.csv
+```
+Then in the dashboard pick **Upload my own CSV** and choose that file.
+
+| Dataset | Source | Notes |
+|---------|--------|-------|
+| UCI Metro Interstate Traffic Volume (48k hourly rows) | `archive.ics.uci.edu/dataset/492` | `date_time` + `traffic_volume`; loads directly (1 site). Verified: KNN MAE 297, R² 0.93. |
+| Kaggle "Banglore City Traffic Dataset" (project's native) | `kaggle datasets download -d preethamgouda/banglore-city-traffic-dataset --unzip` | Area/Road names + Traffic Volume + Date; loads via aliases. Needs a Kaggle account. |
+| Dublin City SCATS volumes | `data.gov.ie` | 5-min intervals; coords in a separate file — needs a join first. |
+| UK DfT road traffic counts | `roadtraffic.dft.gov.uk` | Per-site raw counts + coordinates; join required. |
+
+### 6b. Pipeline viewer — `dashboard/app_pipeline.py` (file-based, full stack)
+The original multi-phase viewer (Volume/Speed/Congestion/Peak/Road-network/
+Shortest-paths + MapReduce/KNN/Anomaly), reading Parquet/CSV produced by the
+Spark and OSMnx phases. Best run via Docker after `docker compose up -d`:
+```bash
+docker compose up -d --build dashboard   # requires Docker Desktop running
+```
+Views whose inputs (Spark Parquet, OSMnx graph) have not been generated show a
+friendly "not available" message rather than crashing.
+
+## 7. Testing
 
 ```bash
-docker compose ps
+python -m unittest discover -s tests -p "test_*.py"   # 25 tests, stdlib only
+```
+Covers schema validation, MapReduce correctness (vs an independent pandas
+reference), KNN (determinism, leakage-free split, invalid params), anomaly
+detection (injected anomaly, no false positive, dedup/idempotency, warm-up,
+malformed rows, state recovery, latency) and an end-to-end chain.
+
+## 8. Measured results
+
+| Metric | Value |
+|--------|-------|
+| Input rows / clean / rejected | 1517 / 1478 / 0 (40 duplicates removed) |
+| Roads, MapReduce groups (road×hour) | 14 / 319 |
+| KNN MAE / RMSE / R² | **6.66 / 9.35 / 0.849** |
+| Baseline MAE / RMSE / R² | 14.44 / 18.34 / 0.418 |
+| KNN MAE improvement vs baseline | **53.9 %** |
+| Anomaly alerts (demo, 6 batches) | 50 (24 moderate / 19 high / 7 severe) |
+| Injected anomaly detected | yes (z ≈ 54, severe) |
+| Unit/integration tests | 25 passed |
+
+## 9. Repository layout
+```
+common/        schema + validation + config + logging (shared data contract)
+python/        prepare_dataset.py, stream_producer.py (hdfs|local), download_dataset.py
+mapreduce/     Hadoop Streaming mapper/reducer + local & cluster runners
+ml/            KNN prediction pipeline
+analytics/     Spark jobs (volume/speed/congestion/peak) + anomaly_detection.py
+graph/         OSMnx graph builder + NetworkX algorithms (host)
+dashboard/     Streamlit app
+tests/         unittest suite + committed fixture
+scripts/       run_pipeline_local.sh (host), demo.sh (viva)
+docker/        Dockerfiles + Hadoop config
+docs/          REPORT_PROJECT.md, REPORT_BEYOND_SYLLABUS.md
+data/          source (committed) · sample (committed) · raw/stream/analytics/models/graph (generated)
 ```
 
-Then open the **NameNode UI** at http://localhost:9871 to confirm HDFS is alive.
-
-**Host ports:** NameNode UI `9871` · DataNode UI `9865` · ResourceManager `8089`
-· NodeManager `8043` · HDFS RPC `9002` · Dashboard `8501`.
-
----
-
-## Running the pipeline (phase by phase)
-
-| Phase | What it does                              | Where it runs | Command |
-|-------|-------------------------------------------|---------------|---------|
-| 1     | HDFS + YARN cluster                       | containers    | `docker compose up -d` (step 2 above) |
-| 2     | Stream CSV → HDFS                         | `poc-streamer`| `docker exec -it poc-streamer python stream_producer.py` |
-| 3     | Spark batch analytics                     | `poc-spark`   | `docker exec -it poc-spark bash /app/analytics/run_all.sh` |
-| 4     | Build OSM road-network graph              | **host**      | `pip install -r graph/requirements.txt` then `python graph/build_graph.py` |
-| 5     | Shortest path / PageRank / centrality     | **host**      | `python graph/algorithms.py` |
-| 6     | Streamlit dashboard                       | `poc-dashboard`| already running → http://localhost:8501 |
-
-### Why Phases 4 & 5 run on the host, not in a container
-
-`build_graph.py` and `algorithms.py` use **OSMnx**, which downloads the
-Bangalore road network over HTTPS from the Overpass API. They're easiest to run
-in a plain host Python env with internet access. They write their outputs into
-`data/graph/` (which is mounted into the dashboard container), so the dashboard
-picks them up automatically — no container rebuild needed.
-
-What each phase produces:
-
-- **Phase 2** → `hdfs:///traffic/stream/YYYY-MM-DD/batch-*.csv` (batches of 500 rows, every 2s; tunable via env in `docker-compose.yml`).
-- **Phase 3** → `hdfs:///traffic/analytics/` **and** `data/analytics/*.parquet` (traffic volume, avg speed, congestion, peak hour).
-- **Phase 4** → `data/graph/bangalore.graphml`, `nodes.parquet`, `edges.parquet`.
-- **Phase 5** → `data/graph/pagerank.parquet`, `betweenness.parquet`, `closeness.parquet`, `sample_shortest_path.parquet`.
-- **Phase 6** → reads all of the above and renders charts + a folium map.
-
----
-
-## Repository layout
-
-```
-docker/            Dockerfiles + Hadoop config (core-site, hdfs-site, yarn-site, ...)
-docker-compose.yml Wires the 4 services together and mounts ./data everywhere
-python/            Host/streamer scripts: download_dataset.py, stream_producer.py
-analytics/         Phase-3 Spark jobs + run_all.sh (runs inside poc-spark)
-graph/             Phase-4/5 OSMnx + networkx scripts (run on the host)
-dashboard/         Phase-6 Streamlit app (app.py)
-data/              Shared data volume — gitignored, populated by the pipeline
-```
-
-Each folder has its own `README.md` with details specific to that stage.
-
----
-
-## Working on this with Claude Code
-
-If you're picking this up and using Claude to help:
-
-- The **data flow diagram above** is the mental model — most confusion comes
-  from forgetting that `./data` is shared across containers and that the graph
-  phases run on the host.
-- Container names (`poc-spark`, etc.) are fixed in `docker-compose.yml`; use
-  them for `docker exec`.
-- Logs: `docker compose logs -f <service>` (e.g. `dashboard`, `hadoop`).
-- To wipe and restart clean: `docker compose down -v` (the `-v` also drops the
-  `hadoop-data` HDFS volume), then rebuild. Your `data/` outputs on the host are
-  separate and survive this.
-- If the dashboard is empty, it's almost always because Phases 2–5 haven't been
-  run yet in this environment — not a code bug.
-
----
-
-## Common issues
-
-| Symptom | Likely cause / fix |
-|---------|--------------------|
-| Dashboard loads but shows nothing | Phases 3–5 haven't run yet → no Parquet in `data/`. Run them. |
-| `kaggle: command not found` | `pip install kaggle` and put the token at `~/.kaggle/kaggle.json`. |
-| Streamer can't reach HDFS | Confirm `poc-hadoop` is healthy (NameNode UI on `9871`); services talk over the `bdc` docker network as `hadoop:9000` / `hadoop:9870`. |
-| OSMnx errors in Phase 4 | Needs host internet to the Overpass API; run it outside Docker in a host venv. |
-| Port already in use | Another process owns `8501`/`9871`/etc. on the host — stop it or remap in `docker-compose.yml`. |
+## 10. Known limitations
+* **No live data** — historical replay only (reproducible demo mode).
+* **No absolute timestamp** — only cyclic day/hour, so chronological evaluation
+  uses replay order; a true calendar split is not possible on this dataset.
+* **Volume units** are an index, not a calibrated vehicle count.
+* **Anomaly latency** (~1.6 s median in the demo) is measured over pre-written
+  batches processed in one pass, not a continuous watcher — see the report.
+* The Spark speed/congestion jobs need the Kaggle named-column CSV; on the
+  coordinate dataset the MapReduce path is the primary aggregation.

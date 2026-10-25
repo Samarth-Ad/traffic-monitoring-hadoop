@@ -1,165 +1,235 @@
-"""Phase 6 — Streamlit traffic insights dashboard.
+"""Bangalore Traffic Intelligence — interactive live dashboard.
 
-Reads Phase-3 analytics Parquet from /data/analytics/ and Phase-4/5 graph
-outputs from /data/graph/. Everything is file-based so the dashboard needs
-no live HDFS connection.
+A self-contained demo UI: pick the built-in dataset **or upload your own CSV**,
+then watch the full analysis run live — data validation, the Hadoop MapReduce
+aggregate, KNN volume prediction, and a streaming near-real-time anomaly feed.
+
+Runs on the host with only streamlit + pandas + scikit-learn (no Spark, no
+OSMnx, no Docker required):
+
+    streamlit run dashboard/app.py
+
+Accepted input: the headerless `lat,lon,day_of_week,hour,volume` format, or any
+CSV whose columns map to the canonical schema (see common/schema.py).
 """
 
 from __future__ import annotations
 
-import os
+import io
+import subprocess
+import sys
+import tempfile
+import time
 from pathlib import Path
 
-import folium
 import pandas as pd
-import plotly.express as px
 import streamlit as st
-from streamlit_folium import st_folium
 
-ANALYTICS_DIR = Path(os.environ.get("ANALYTICS_DIR", "/data/analytics"))
-GRAPH_DIR = Path(os.environ.get("GRAPH_DIR", "/data/graph"))
+APP_DIR = Path(__file__).resolve().parent
+# Host: packages live in the repo root (parent of dashboard/).
+# Container: they are mounted beside app.py under /app.
+ROOT = APP_DIR if (APP_DIR / "mapreduce").exists() else APP_DIR.parent
+sys.path.insert(0, str(ROOT))
 
-st.set_page_config(page_title="Bangalore Traffic Insights", layout="wide", page_icon="🚦")
+from common import config  # noqa: E402
+from common.schema import load_any, load_any_text, validate  # noqa: E402
+from ml.knn_predict import train_and_evaluate  # noqa: E402
+from analytics.anomaly_detection import AnomalyDetector  # noqa: E402
+
+st.set_page_config(page_title="Bangalore Traffic Intelligence", layout="wide", page_icon="🚦")
+
+MAPPER = ROOT / "mapreduce" / "mapper.py"
+REDUCER = ROOT / "mapreduce" / "reducer.py"
 
 
+# ------------------------------------------------------------------ helpers
 @st.cache_data(show_spinner=False)
-def load_parquet(path: Path) -> pd.DataFrame | None:
-    if not path.exists():
-        return None
-    return pd.read_parquet(path)
+def _validate_text(text: str) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    report = validate(load_any_text(text))
+    return report.clean, report.rejected, report.reasons
 
 
-def section_header(title: str, note: str = "") -> None:
-    st.markdown(f"### {title}")
-    if note:
-        st.caption(note)
+def run_mapreduce(canonical: pd.DataFrame) -> pd.DataFrame:
+    """Run the REAL Hadoop Streaming mapper|sort|reducer on this data."""
+    text = canonical.to_csv(index=False)
+    mapped = subprocess.run([sys.executable, str(MAPPER)], input=text,
+                            capture_output=True, text=True, check=True)
+    ordered = "\n".join(sorted(mapped.stdout.splitlines())) + "\n"
+    reduced = subprocess.run([sys.executable, str(REDUCER)], input=ordered,
+                             capture_output=True, text=True, check=True)
+    return pd.read_csv(io.StringIO(reduced.stdout))
 
 
-def missing(label: str, path: Path) -> None:
-    st.info(f"**{label}** not available yet — expected at `{path}`.")
+def _builtin_text() -> str:
+    for cand in (config.SOURCE_DIR / "bangalore_traffic_raw.txt", config.SAMPLE_CSV, config.CANONICAL_CSV):
+        if cand.exists():
+            return cand.read_text(encoding="utf-8")
+    raise FileNotFoundError("No built-in dataset found; run python/prepare_dataset.py.")
 
 
-# -------------------- Sidebar --------------------
-st.sidebar.title("Bangalore Traffic")
-st.sidebar.markdown(
-    "**Pipeline**\n\n"
-    "1. HDFS (Phase 1)\n"
-    "2. Streaming (Phase 2)\n"
-    "3. Spark analytics (Phase 3)\n"
-    "4. Road graph (Phase 4)\n"
-    "5. Graph algorithms (Phase 5)\n"
-    "6. **This dashboard**"
-)
-view = st.sidebar.radio(
-    "View",
-    ["Overview", "Volume", "Speed", "Congestion", "Peak windows", "Road network", "Shortest paths"],
-)
+# ------------------------------------------------------------------ sidebar
+st.sidebar.title("🚦 Traffic Intelligence")
+st.sidebar.caption("Upload data → watch the Big Data pipeline run live.")
 
-# -------------------- Overview --------------------
-if view == "Overview":
-    st.title("🚦 Bangalore Traffic — Big Data Insights")
-    st.markdown(
-        "Dockerized Hadoop 3.4.2 + Spark 3.5 + OSMnx road network. "
-        "Analytics layer aggregates the Kaggle Bangalore traffic dataset by road and time; "
-        "the graph layer runs PageRank, centrality and shortest-path on the OpenStreetMap "
-        "drivable network for the city."
+source = st.sidebar.radio("Data source", ["Built-in Bangalore dataset", "Upload my own CSV"])
+
+raw_text: str | None = None
+if source == "Upload my own CSV":
+    up = st.sidebar.file_uploader("CSV / TXT", type=["csv", "txt"])
+    if up is not None:
+        raw_text = up.getvalue().decode("utf-8", errors="replace")
+    st.sidebar.caption(
+        "Expected: `lat,lon,day_of_week,hour,volume` (headerless), or a CSV with "
+        "columns that map to them."
     )
-    cols = st.columns(4)
-    vol = load_parquet(ANALYTICS_DIR / "traffic_volume_by_road")
-    spd = load_parquet(ANALYTICS_DIR / "avg_speed_by_road")
-    cong = load_parquet(ANALYTICS_DIR / "congestion_by_road")
-    pr = load_parquet(GRAPH_DIR / "pagerank.parquet")
-    cols[0].metric("Roads tracked", f"{len(vol):,}" if vol is not None else "—")
-    cols[1].metric("Mean speed km/h", f"{spd['avg_speed_kmh'].mean():.1f}" if spd is not None else "—")
-    cols[2].metric("Avg congestion", f"{cong['avg_congestion'].mean():.1f}" if cong is not None else "—")
-    cols[3].metric("Junctions in graph", f"{len(pr):,}" if pr is not None else "—")
+else:
+    try:
+        raw_text = _builtin_text()
+    except FileNotFoundError as exc:
+        st.sidebar.error(str(exc))
 
-# -------------------- Volume --------------------
-elif view == "Volume":
-    section_header("Traffic Volume by Road", "Phase 3.1 — Spark aggregation")
-    df = load_parquet(ANALYTICS_DIR / "traffic_volume_by_road")
-    if df is None:
-        missing("Volume analytics", ANALYTICS_DIR / "traffic_volume_by_road")
-    else:
-        top_n = st.slider("Top N roads", 5, 50, 20)
-        head = df.sort_values("total_volume", ascending=False).head(top_n)
-        fig = px.bar(head, x="road", y="total_volume", color="area", title="Top roads by total volume")
-        fig.update_layout(xaxis_tickangle=-40, height=500)
-        st.plotly_chart(fig, use_container_width=True)
-        st.dataframe(df, use_container_width=True)
+st.sidebar.markdown("---")
+k = st.sidebar.slider("KNN neighbours (k)", 1, 25, 7)
+weights = st.sidebar.selectbox("KNN weighting", ["distance", "uniform"])
+threshold = st.sidebar.slider("Anomaly threshold (robust z)", 2.0, 8.0, 3.5, 0.5)
+batch_size = st.sidebar.slider("Stream batch size", 20, 500, 150, 10)
+speed = st.sidebar.select_slider("Stream speed", ["fast", "medium", "slow"], value="medium")
+inject = st.sidebar.checkbox("Inject a demo anomaly", value=True,
+                             help="Adds one extreme batch so an alert is guaranteed")
+SPEED_DELAY = {"fast": 0.05, "medium": 0.2, "slow": 0.5}[speed]
 
-# -------------------- Speed --------------------
-elif view == "Speed":
-    section_header("Average Speed by Road", "Phase 3.2")
-    df = load_parquet(ANALYTICS_DIR / "avg_speed_by_road")
-    if df is None:
-        missing("Speed analytics", ANALYTICS_DIR / "avg_speed_by_road")
-    else:
-        fig = px.histogram(df, x="avg_speed_kmh", nbins=30, title="Distribution of avg speed (km/h)")
-        st.plotly_chart(fig, use_container_width=True)
-        slow = df.sort_values("avg_speed_kmh").head(20)
-        st.markdown("**Slowest 20 roads**")
-        st.dataframe(slow, use_container_width=True)
+st.title("Bangalore Traffic Intelligence")
+st.caption("Distributed analytics · MapReduce · KNN prediction · near-real-time anomaly detection")
 
-# -------------------- Congestion --------------------
-elif view == "Congestion":
-    section_header("Congestion Hotspots", "Phase 3.3 — threshold-based flagging")
-    df = load_parquet(ANALYTICS_DIR / "congestion_by_road")
-    if df is None:
-        missing("Congestion analytics", ANALYTICS_DIR / "congestion_by_road")
+if not raw_text:
+    st.info("⬅️ Choose the built-in dataset or upload a CSV in the sidebar to begin.")
+    st.stop()
+
+# ------------------------------------------------------------------ load + validate
+clean, rejected, reasons = _validate_text(raw_text)
+
+if clean.empty:
+    st.error("No valid rows after validation. Check the file format (see the sidebar hint).")
+    if reasons:
+        st.write("Rejection reasons:", reasons)
+    st.stop()
+
+tab_data, tab_mr, tab_knn, tab_anom = st.tabs(
+    ["① Data & validation", "② MapReduce aggregate", "③ KNN prediction", "④ Live anomaly feed"]
+)
+
+# ------------------------------------------------------------------ ① data
+with tab_data:
+    c = st.columns(4)
+    c[0].metric("Input rows", f"{len(clean) + len(rejected):,}")
+    c[1].metric("Clean rows", f"{len(clean):,}")
+    c[2].metric("Rejected", f"{len(rejected):,}")
+    c[3].metric("Roads", f"{clean['road_id'].nunique():,}")
+    if reasons:
+        st.caption("Validation notes: " + ", ".join(f"{k2}={v}" for k2, v in reasons.items()))
+    st.markdown("**Average volume by hour of day**")
+    by_hour = clean.groupby("hour")["volume"].mean()
+    st.line_chart(by_hour)
+    st.markdown("**Sample of the canonical data**")
+    st.dataframe(clean.head(200), use_container_width=True)
+
+# ------------------------------------------------------------------ ② MapReduce
+with tab_mr:
+    st.caption("Produced by the real Hadoop Streaming job (`mapreduce/mapper.py` + `reducer.py`).")
+    try:
+        mr = run_mapreduce(clean)
+    except subprocess.CalledProcessError as exc:
+        st.error(f"MapReduce failed: {exc.stderr}")
+        mr = None
+    if mr is not None and not mr.empty:
+        st.metric("Aggregated (road × hour) groups", f"{len(mr):,}")
+        roads = sorted(mr["road_id"].unique())
+        chosen = st.multiselect("Roads to plot", roads, default=roads[: min(4, len(roads))])
+        shown = mr[mr["road_id"].isin(chosen)] if chosen else mr
+        pivot = shown.pivot_table(index="time_bucket", columns="road_id", values="avg_volume")
+        st.markdown("**Average volume by hour (per road)**")
+        st.line_chart(pivot)
+        st.dataframe(mr.sort_values(["road_id", "time_bucket"]), use_container_width=True)
+
+# ------------------------------------------------------------------ ③ KNN
+with tab_knn:
+    if len(clean) < max(10, k + 1):
+        st.warning(f"Need at least {max(10, k + 1)} rows for KNN; this dataset has {len(clean)}.")
     else:
-        fig = px.scatter(
-            df, x="avg_congestion", y="congested_fraction",
-            size="samples", color="area", hover_name="road",
-            title="Congestion fraction vs. average",
+        res = train_and_evaluate(clean, k=k, weights=weights, test_frac=0.2)
+        knn, base = res["knn"], res["baseline"]
+        c = st.columns(4)
+        c[0].metric("KNN MAE", f"{knn.mae:.2f}")
+        c[1].metric("KNN RMSE", f"{knn.rmse:.2f}")
+        c[2].metric("KNN R²", f"{knn.r2:.3f}")
+        improv = (base.mae - knn.mae) / base.mae * 100 if base.mae else 0.0
+        c[3].metric("vs baseline MAE", f"{improv:+.1f}%", help=f"Baseline MAE {base.mae:.2f}")
+        st.caption(
+            f"Target: volume · features: road (one-hot) + cyclical hour/day · "
+            f"replay-order holdout (train {len(clean)-knn.n_test}, test {knn.n_test})."
         )
-        st.plotly_chart(fig, use_container_width=True)
-        st.dataframe(df.sort_values("avg_congestion", ascending=False), use_container_width=True)
+        preds = res["predictions"].copy()
+        st.markdown("**Actual vs predicted volume** (points on the diagonal are perfect)")
+        st.scatter_chart(preds, x="actual_volume", y="predicted_volume", color="road_id", height=360)
+        st.dataframe(preds, use_container_width=True)
 
-# -------------------- Peak --------------------
-elif view == "Peak windows":
-    section_header("Peak Volume Windows per Road", "Phase 3.4 — top-3 time buckets")
-    df = load_parquet(ANALYTICS_DIR / "peak_windows")
-    if df is None:
-        missing("Peak-window analytics", ANALYTICS_DIR / "peak_windows")
-    else:
-        fig = px.bar(df.head(60), x="road", y="avg_volume", color="peak_window",
-                     title="Peak time windows", barmode="group")
-        fig.update_layout(xaxis_tickangle=-40, height=500)
-        st.plotly_chart(fig, use_container_width=True)
-        st.dataframe(df, use_container_width=True)
+# ------------------------------------------------------------------ ④ live anomaly
+with tab_anom:
+    st.caption(
+        "Robust median/MAD detector. Baselines are learned from the dataset, then "
+        "batches are replayed and scored live — alerts appear as they are found."
+    )
+    start = st.button("▶ Run live analysis", type="primary")
+    if start:
+        tmp = Path(tempfile.mkdtemp())
+        det = AnomalyDetector(threshold=threshold, min_samples=5,
+                              state_path=tmp / "state.json", alerts_path=tmp / "alerts.csv")
+        det.fit_baseline(clean)
 
-# -------------------- Graph --------------------
-elif view == "Road network":
-    section_header("Road-Network Importance", "Phase 4 (graph) + Phase 5 PageRank")
-    nodes = load_parquet(GRAPH_DIR / "nodes.parquet")
-    pr = load_parquet(GRAPH_DIR / "pagerank.parquet")
-    if nodes is None or pr is None:
-        missing("Graph outputs", GRAPH_DIR)
-    else:
-        merged = nodes.merge(pr, on="node_id", how="inner")
-        top = merged.sort_values("pagerank", ascending=False).head(300)
-        center = [top["lat"].mean(), top["lon"].mean()]
-        m = folium.Map(location=center, zoom_start=12, tiles="cartodbpositron")
-        max_pr = top["pagerank"].max()
-        for _, row in top.iterrows():
-            folium.CircleMarker(
-                location=[row.lat, row.lon],
-                radius=3 + 10 * (row.pagerank / max_pr),
-                color="crimson", fill=True, fill_opacity=0.6,
-                popup=f"node {row.node_id}<br>pagerank={row.pagerank:.3e}",
-            ).add_to(m)
-        st_folium(m, height=600, use_container_width=True)
-        st.markdown("**Top-20 junctions by PageRank**")
-        st.dataframe(top.head(20)[["node_id", "lat", "lon", "pagerank"]], use_container_width=True)
+        batches = [clean.iloc[i:i + batch_size].copy() for i in range(0, len(clean), batch_size)]
+        if inject:
+            spike = clean.head(3).copy()
+            spike["hour"], spike["day_of_week"], spike["volume"] = 2, 1, 99
+            batches.append(spike)
 
-# -------------------- Paths --------------------
-elif view == "Shortest paths":
-    section_header("Sampled Shortest Paths", "Phase 5 — Dijkstra on edge length")
-    paths = load_parquet(GRAPH_DIR / "sample_shortest_path.parquet")
-    if paths is None:
-        missing("Shortest-path samples", GRAPH_DIR / "sample_shortest_path.parquet")
+        prog = st.progress(0.0, text="Starting stream…")
+        mcols = st.columns(4)
+        m_batch, m_rows, m_alerts, m_sev = (mcols[0].empty(), mcols[1].empty(),
+                                            mcols[2].empty(), mcols[3].empty())
+        chart_ph = st.empty()
+        table_ph = st.empty()
+
+        all_alerts: list[dict] = []
+        per_batch: list[dict] = []
+        total_rows = 0
+        for i, b in enumerate(batches):
+            label = "INJECTED-anomaly" if (inject and i == len(batches) - 1) else f"batch-{i:03d}"
+            alerts = det.process_batch(b, label)
+            all_alerts.extend(alerts)
+            total_rows += len(b)
+            per_batch.append({"batch": i, "alerts": len(alerts)})
+
+            m_batch.metric("Batches", f"{i + 1}/{len(batches)}")
+            m_rows.metric("Rows processed", f"{total_rows:,}")
+            m_alerts.metric("Alerts", f"{len(all_alerts):,}")
+            sev = sum(1 for a in all_alerts if a["severity"] == "severe")
+            m_sev.metric("Severe", f"{sev:,}")
+            chart_ph.bar_chart(pd.DataFrame(per_batch).set_index("batch"))
+            if all_alerts:
+                recent = pd.DataFrame(all_alerts)[
+                    ["road_id", "day_of_week", "hour", "observed_volume",
+                     "expected_volume", "deviation_score", "direction", "severity", "batch_id"]
+                ]
+                table_ph.dataframe(recent.tail(15), use_container_width=True)
+            prog.progress((i + 1) / len(batches), text=f"Processed {label}")
+            time.sleep(SPEED_DELAY)
+
+        prog.progress(1.0, text="Done")
+        if all_alerts:
+            st.success(f"Stream complete — {len(all_alerts)} potential unusual-traffic events detected.")
+            st.download_button("Download alerts CSV", pd.DataFrame(all_alerts).to_csv(index=False),
+                               "alerts.csv", "text/csv")
+        else:
+            st.info("Stream complete — no anomalies above the threshold. Lower it or inject a demo anomaly.")
     else:
-        st.dataframe(paths.sort_values("length_m"), use_container_width=True)
-        fig = px.histogram(paths, x="length_m", nbins=20, title="Shortest-path length distribution (m)")
-        st.plotly_chart(fig, use_container_width=True)
+        st.info("Press **Run live analysis** to stream the data and watch anomalies surface.")
